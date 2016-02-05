@@ -29,7 +29,7 @@ DEPEND="${CDEPEND}
 PATCHES=(
 	"${FILESDIR}"/${PN}-4.3.0-no-utempter.patch
 	"${FILESDIR}"/${PN}-4.3.1-ansi.c.patch
-	"${FILESDIR}"/${PN}-4.3.1-aixipv6.patch
+	"${FILESDIR}"/${PN}-4.3.1-aix.patch
 )
 
 pkg_setup() {
