@@ -1,0 +1,15 @@
+--- configure	2012-03-20 05:56:01 -0700
++++ configure	2012-03-20 21:08:13 -0700
+@@ -7768,6 +7768,12 @@
+ 	if test "$module" = yes || test "$export_dynamic" = yes; then
+ 	  # On all known operating systems, these are identical.
+ 	  dlname="$soname"
++          # But in Gentoo/Prefix on AIX we add (shro.o)
++          case $host_os in
++            aix[5-9]*)
++              dlname="${soname%\(shr.o\)}"
++              ;;
++          esac
+ 	fi
+       fi
+       ;;
