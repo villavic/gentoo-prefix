@@ -71,10 +71,12 @@ src_configure() {
 		local lbuildflags="-static"
 
 		# some toolchains don't quite support static linking
-		local dbuildflags="-Wl,-rpath,${WORKDIR}/lib"
+		local dbuildflags=
 		case ${CHOST} in
-			*-darwin*)  dbuildflags=     ;;
-			*-aix*)     dbuildflags=     ;;
+			*-darwin*)  ;;
+			*-aix*)     ;;
+			*-solaris*) dbuildflags="-Wl,-R,${WORKDIR}/lib" ;;
+			*)          dbuildflags="-Wl,-rpath,${WORKDIR}/lib" ;;
 		esac
 		echo "int main() {}" | \
 			$(tc-getCC) -o x -x c - ${lbuildflags} -pipe >& /dev/null \
@@ -112,6 +114,8 @@ do_configure() {
 		# add '--with-terminfo-dirs' and then populate /etc/terminfo in
 		# src_install() ...
 		--with-terminfo-dirs="${EPREFIX}/etc/terminfo:${EPREFIX}/usr/share/terminfo"
+		# do not install in subdir (EPREFIX/usr/include/ncurses)
+		--enable-overwrite
 
 		# Disabled until #245417 is sorted out.
 		#$(use_with berkdb hashed-db)
@@ -166,7 +170,12 @@ do_configure() {
 		conf+=( --without-{pthread,reentrant} )
 	fi
 	# Make sure each variant goes in a unique location.
-	if [[ ${target} != "ncurses" ]] ; then
+	if [[ ${target} == "ncurses" ]] ; then
+		# "ncurses" variant goes into "${EPREFIX}"/usr/include
+		# It is needed on Prefix because the configure script appends
+		# "ncurses" to "${prefix}/include" if "${prefix}" is not /usr.
+		conf+=( --enable-overwrite )
+	else
 		conf+=( --includedir="${EPREFIX}"/usr/include/${target} )
 	fi
 	# See comments in src_configure.
@@ -184,9 +193,9 @@ do_configure() {
 
 src_compile() {
 	# See comments in src_configure.
-	if ! ROOT=/ has_version "~sys-libs/${P}" ; then
+	if ! ROOT=/ has_version "~sys-libs/${P}:0" ; then
 		BUILD_DIR="${WORKDIR}" \
-		do_compile cross -C progs tic
+		do_compile cross -C progs GET_PROGS=
 	fi
 
 	multilib-minimal_src_compile
@@ -236,7 +245,7 @@ multilib_src_install() {
 		# Provide a link for -lcurses.
 		ln -sf libncurses$(get_libname) "${ED}"/usr/$(get_libdir)/libcurses$(get_libname) || die
 	fi
-	use static-libs || find "${ED}"/usr/ -name '*.a' -delete
+	use static-libs || find "${ED}"/usr/ -name '*.a' -not -name "*$(get_libname)" -delete
 
 	# Build fails to create this ...
 	dosym ../share/terminfo /usr/$(get_libdir)/terminfo

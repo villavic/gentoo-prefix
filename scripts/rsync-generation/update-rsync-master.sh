@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 
 # get keys for ssh and signing
-eval $(keychain -q --noask --eval)
+eval $(env SHELL=/bin/bash keychain -q --noask --eval)
 
 BASE_PATH="$(readlink -f "${BASH_SOURCE[0]%/*}")"
 
 HGDIR="${BASE_PATH}/repos/prefix-tree"
 CVSDIR="${BASE_PATH}/repos/gentoo-x86"
-DTDDIR="${BASE_PATH}/repos/xml/htdocs/dtd"
-GLSADIR="${BASE_PATH}/repos/xml/htdocs/security/en/glsa"
+DTDDIR="${BASE_PATH}/repos/dtd"
+GLSADIR="${BASE_PATH}/repos/glsa"
 NEWSDIR="${BASE_PATH}/repos/gentoo-news"
-HERDSDIR="${BASE_PATH}/repos/xml/htdocs/proj/en/metastructure/herds"
 RSYNCDIR="${BASE_PATH}/master-rsync-tree"
 
 #### ---- Portage setup (use local modified copy) ---- ####
@@ -33,7 +32,7 @@ echo "(init) PATH=$PATH"
 
 #### ---- egencache settings ---- ####
 
-EGENCACHE_OPTS="--jobs=2 --load-average=3 --tolerant --update-use-local-desc"
+EGENCACHE_OPTS="--jobs=4 --load-average=3 --tolerant --update-use-local-desc"
 
 export PYTHONPATH PORTDIR PORTAGE_BASE_PATH PORTAGE_CONFIGROOT  \
 	ROOT PORTAGE_TMPFS FEATURES HOME
@@ -46,7 +45,7 @@ GLOBALSTART=${START}
 # update DTDs
 echo "($(date +"%F %R")) updating DTDs"
 pushd "$DTDDIR" || exit 1
-cvs -q update -dP
+git pull -q
 popd || exit 1
 # rsync the DTDs
 rsync -v --delete -aC "${DTDDIR}" "${RSYNCDIR}"/metadata/ || exit 1
@@ -56,7 +55,7 @@ echo "($(date +"%F %R")) set date to $(< "${RSYNCDIR}"/metadata/dtd/timestamp.ch
 # update GLSAs
 echo "($(date +"%F %R")) updating GLSAs"
 pushd "$GLSADIR" || exit 1
-cvs -q update -dP
+git pull -q
 popd || exit 1
 # rsync the GLSAs
 rsync -v --delete -aC "${GLSADIR}" "${RSYNCDIR}"/metadata/ || exit 1
@@ -73,13 +72,13 @@ rsync -v -Wa --exclude .git --delete "${NEWSDIR}" "${RSYNCDIR}"/metadata/news/
 date -R -u > "${RSYNCDIR}"/metadata/news/timestamp.chk
 echo "($(date +"%F %R")) set date to $(< "${RSYNCDIR}"/metadata/news/timestamp.chk)"
 
-# update herds
-echo "($(date +"%F %R")) updating herds.xml"
-pushd "${HERDSDIR}" || exit 1
-cvs -q update herds.xml
+# update projects
+echo "($(date +"%F %R")) updating projects.xml"
+pushd "${RSYNCDIR}"/metadata/ || exit 1
+rm -f projects.xml
+wget -q "https://api.gentoo.org/metastructure/projects.xml" || exit 1
 popd || exit 1
-rsync -v -a "${HERDSDIR}"/herds.xml "${RSYNCDIR}"/metadata/herds.xml || exit 1
-echo "($(date +"%F %R")) herds.xml updated"
+echo "($(date +"%F %R")) projectss.xml updated"
 
 STOP=$(date +%s)
 TIME_METADATA=$((STOP - START))
@@ -208,14 +207,26 @@ START=$(date +%s)
 
 # generate the metadata
 echo "($(date +"%F %R")) generating metadata"
-"${PORTAGE_BASE_PATH}/bin/egencache" --update --rsync \
+dolog() {
+	echo $*
+	"$@"
+}
+dolog "${PORTAGE_BASE_PATH}/bin/egencache" --update --rsync \
 	--config-root="${PORTAGE_CONFIGROOT}" \
 	--cache-dir="${PORTAGE_DEPCACHEDIR}" \
-	--portdir="${RSYNCDIR}" \
 	--repo=gentoo_prefix \
+	--repositories-configuration='
+[DEFAULT]
+main-repo = gentoo_prefix
+
+[gentoo_prefix]
+location = '"${RSYNCDIR}"'
+sync-type = rsync
+sync-uri = rsync://dont-sync
+auto-sync = no
+' \
 	${EGENCACHE_OPTS} \
 	|| exit 5
-	#--repositories-configuration="/etc/repos.conf/gentoo_prefix.conf" \
 
 STOP=$(date +%s)
 TIME_EGENCACHE=$((STOP - START))
@@ -232,5 +243,13 @@ chmod -R u-s,g-s "${RSYNCDIR}"/metadata
 STOP=$(date +%s)
 TIME_TOTAL=$((STOP - GLOBALSTART))
 
-echo "${GLOBALSTART}	\"$(date +"%F %H:%M" -d @${GLOBALSTART})\"	${TIME_METADATA}	${TIME_SVNPREFIX}	${TIME_CVSGX86} ${TIME_EGENCACHE}	${TIME_TOTAL}	${TIME_MANISIGN}" >> \
-	/export/gentoo/statistics/stats/timing-rsync0.data
+# feed timings to graphite
+prefix="gentoo.rsync-generation.$(hostname -s)"
+{
+	echo "${prefix}.pull-metadata ${TIME_METADATA} ${GLOBALSTART}"
+	echo "${prefix}.pull-overlay ${TIME_SVNPREFIX} ${GLOBALSTART}"
+	echo "${prefix}.pull-gx86 ${TIME_CVSGX86} ${GLOBALSTART}"
+	echo "${prefix}.egencache ${TIME_EGENCACHE} ${GLOBALSTART}"
+	echo "${prefix}.wallclock ${TIME_TOTAL} ${GLOBALSTART}"
+	echo "${prefix}.signing ${TIME_MANISIGN} ${GLOBALSTART}"
+} | nc -q 0 localhost 3002

@@ -1,10 +1,12 @@
 /* Copyright 2006-2015 Gentoo Foundation; Distributed under the GPL v2 */
 #include <stdio.h>
+#include <string.h>
 #include <strings.h>
 #include <dirent.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <openssl/sha.h>
 #include <openssl/whrlpool.h>
 

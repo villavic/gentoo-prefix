@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright 2006-2015 Gentoo Foundation; Distributed under the GPL v2
+# Copyright 2006-2016 Gentoo Foundation; Distributed under the GPL v2
 # $Id: bootstrap-prefix.sh 61818 2014-01-08 07:28:16Z haubi $
 
 trap 'exit 1' TERM KILL INT QUIT ABRT
@@ -7,6 +7,9 @@ trap 'exit 1' TERM KILL INT QUIT ABRT
 # some basic output functions
 eerror() { echo "!!! $*" 1>&2; }
 einfo() { echo "* $*"; }
+# RAP (libc) mode is triggered if the script is renamed to bootstrap-rap.sh.
+is-rap() { [[ ${BASH_SOURCE} = *rap.sh ]]; }
+rapx() { is-rap && echo $1 || echo $2; }
 
 # prefer gtar over tar
 [[ x$(type -t gtar) == "xfile" ]] \
@@ -42,13 +45,13 @@ efetch() {
 			# curl, FreeBSD's fetch and ftp.
 			if [[ x$(type -t wget) == "xfile" ]] ; then
 				FETCH_COMMAND="wget"
-			elif [[ x$(type -t ftp) == "xfile" ]] ; then
-				FETCH_COMMAND="ftp"
 			elif [[ x$(type -t curl) == "xfile" ]] ; then
 				einfo "WARNING: curl doesn't fail when downloading fails, please check its output carefully!"
-				FETCH_COMMAND="curl -L -O"
+				FETCH_COMMAND="curl -f -L -O"
 			elif [[ x$(type -t fetch) == "xfile" ]] ; then
 				FETCH_COMMAND="fetch"
+			elif [[ x$(type -t ftp) == "xfile" ]] ; then
+				FETCH_COMMAND="ftp"
 			else
 				eerror "no suitable download manager found (need wget, curl, fetch or ftp)"
 				eerror "could not download ${1##*/}"
@@ -128,30 +131,39 @@ configure_cflags() {
 
 	case ${CHOST} in
 		# note: we need CXX for binutils-apple which' ld is c++
-		# Clang on OSX defaults to c99 mode, while GCC defaults to gnu89
-		# (C90 + extensions).  This makes Clang barf on GCC's sources, so
-		# work around that.  Bug #491098
 		*64-apple* | sparcv9-*-solaris* | x86_64-*-solaris*)
-			export CC="${CC-gcc} -m64 -std=gnu89"
+			export CC="${CC-gcc} -m64"
 			export CXX="${CXX-g++} -m64"
-			export HOSTCC="${CC-gcc} -m64 -std=gnu89"
+			export HOSTCC="${CC}"
 			;;
 		i*86-apple-darwin1*)
-			export CC="${CC-gcc} -m32 -std=gnu89"
+			export CC="${CC-gcc} -m32"
 			export CXX="${CXX-g++} -m32"
-			export HOSTCC="${CC-gcc} -m32 -std=gnu89"
+			export HOSTCC="${CC}"
 			;;
-		*)
+		i*86-pc-linux-gnu)
+			if [[ $(${CC} -dumpspecs | grep -A1 multilib_default) != *m32 ]]; then
+				export CC="${CC-gcc} -m32"
+				export CXX="${CXX-g++} -m32"
+			fi
 			;;
 	esac
 }
 
 configure_toolchain() {
-	linker=sys-devel/binutils
+	linker="sys-devel/binutils"
 	local gcc_deps="dev-libs/gmp dev-libs/mpfr dev-libs/mpc"
 	compiler="${gcc_deps} sys-devel/gcc-config sys-devel/gcc"
-	# The host may not have a functioning c++ toolchain, so use a stage1 compiler that can build with C only.
-	compiler_stage1="${gcc_deps} sys-devel/gcc-config <sys-devel/gcc-4.8"
+	compiler_stage1="${gcc_deps} sys-devel/gcc-config"
+	case ${CHOST} in
+	*-cygwin*)
+	  # not supported in gcc-4.7 yet, easy enough to install g++
+	  compiler_stage1+=" sys-devel/gcc"
+	  ;;
+	*)
+	  # The host may not have a functioning c++ toolchain, so use a stage1 compiler that can build with C only.
+	  compiler_stage1+=" <sys-devel/gcc-4.8"
+	esac
 
 	CC=gcc
 	CXX=g++
@@ -160,7 +172,7 @@ configure_toolchain() {
 			# for compilers choice, see bug:
 			# https://bugs.gentoo.org/show_bug.cgi?id=538366
 			compiler_stage1="sys-apps/darwin-miscutils sys-libs/csu"
-			case "$( (unset CHOST; gcc --version) )" in
+			case "$( (unset CHOST; gcc --version 2>/dev/null) )" in
 				*"(GCC) 4.2.1 "*|*"Apple LLVM version "*)
 					linker=sys-devel/binutils-apple
 					if type -P clang > /dev/null ; then
@@ -179,11 +191,23 @@ configure_toolchain() {
 			esac
 			# we always have to bootstrap with 3.4 for else we'd need
 			# libcxx, which only compiles with clang
-			local libcxx="sys-libs/libcxx-headers sys-libs/libcxxabi sys-libs/libcxx"
-			compiler_stage1+=" dev-libs/libffi <sys-devel/llvm-3.5 ${libcxx}"
+			compiler_stage1+=" dev-libs/libffi <sys-devel/llvm-3.5"
 			# similar, the deps for 3.6+ are too high (cmake, ninja,
 			# python) so we have to do this with an intermediate
-			compiler="${libcxx} sys-libs/csu dev-libs/libffi <sys-devel/llvm-3.6 <sys-devel/clang-3.6"
+			local cdep="3.5.9999"
+			# unfortunately, gmp needs c++, thus libcxx, so have to drag
+			# it in early (gmp is necessary for 3.5+)
+			local libcxx="
+				<sys-libs/libcxx-headers-${cdep}
+				<sys-libs/libcxxabi-${cdep}
+				<sys-libs/libcxx-${cdep}"
+			compiler_stage1+=" ${libcxx}"
+			compiler="
+				${libcxx}
+				sys-libs/csu
+				dev-libs/libffi
+				<sys-devel/llvm-${cdep}
+				<sys-devel/clang-${cdep}"
 			;;
 		*-*-aix*)
 			linker=sys-devel/native-cctools
@@ -194,6 +218,11 @@ configure_toolchain() {
 bootstrap_setup() {
 	local profile=""
 	einfo "setting up some guessed defaults"
+
+	# 2.6.32.1 -> 2*256^3 + 6*256^2 + 32 * 256 + 1 = 33955841
+	kver() { uname -r|cut -d\- -f1|awk -F. '{for (i=1; i<=NF; i++){s+=lshift($i,(4-i)*8)};print s}'; }
+	# >=glibc-2.20 requires >=linux-2.6.32.
+	profile-legacy() { [[ $(kver) -ge 33955840 ]] || echo /legacy; }
 	
 	if [[ ! -f ${ROOT}/etc/portage/make.conf ]] ; then
 		{
@@ -203,7 +232,11 @@ bootstrap_setup() {
 			echo 'CXXFLAGS="${CFLAGS}"'
 			echo "MAKEOPTS=\"${MAKEOPTS}\""
 			echo "CONFIG_SHELL=\"${ROOT}/bin/bash\""
-			if [[ -n ${PREFIX_DISABLE_USR_SPLIT} ]] ; then
+			if is-rap ; then
+				echo "# sandbox does not work well on Prefix, bug 490246"
+				echo 'FEATURES="-usersandbox -sandbox"'
+			fi
+			if [[ !is-rap && -n ${PREFIX_DISABLE_USR_SPLIT} ]] ; then
 				echo
 				echo "# This disables /usr-split, removing this will break"
 				echo "PREFIX_DISABLE_GEN_USR_LDSCRIPT=yes"
@@ -214,6 +247,37 @@ bootstrap_setup() {
 				echo 'FETCHCOMMAND="bash -c \"echo I need \${FILE} from \${URI} in \${DISTDIR}; read\""'
 		} > "${ROOT}"/etc/portage/make.conf
 	fi
+
+	if is-rap && [[ ! -f ${ROOT}/etc/portage/repos.conf ]] ; then
+		cat  >"${ROOT}"/etc/portage/repos.conf <<-EOF
+			[DEFAULT]
+			main-repo = gentoo
+			eclass-overrides = rap
+
+			[gentoo]
+			location = ${ROOT}/usr/portage
+			sync-type = rsync
+			sync-uri = rsync://rsync.gentoo.org/gentoo-portage
+
+			[rap]
+			location = ${ROOT}/usr/portage-stage
+			sync-type = git
+			sync-uri = https://anongit.gentoo.org/git/proj/android.git
+			auto-sync = no
+			EOF
+	fi
+
+	if is-rap ; then
+		[[ -f ${ROOT}/etc/passwd ]] || getent passwd > "${ROOT}"/etc/passwd || \
+			ln -sf {,"${ROOT}"}/etc/passwd
+		[[ -f ${ROOT}/etc/group ]] || getent group > "${ROOT}"/etc/group || \
+			ln -sf {,"${ROOT}"}/etc/group
+		[[ -f ${ROOT}/etc/resolv.conf ]] || ln -s {,"${ROOT}"}/etc/resolv.conf
+		[[ -f ${ROOT}/etc/hosts ]] || cp {,"${ROOT}"}/etc/hosts
+		local legacy=$(profile-legacy)
+	fi
+
+	local linux=$(rapx linux-standalone linux)
 	
 	case ${CHOST} in
 		powerpc-apple-darwin7)
@@ -240,22 +304,22 @@ bootstrap_setup() {
 			profile="prefix/darwin/macos/10.$((rev - 4))/x64"
 			;;
 		i*86-pc-linux-gnu)
-			profile="prefix/linux/x86"
+			profile="prefix/${linux}/x86${legacy}"
 			;;
 		x86_64-pc-linux-gnu)
-			profile="prefix/linux/amd64"
+			profile="prefix/${linux}/amd64${legacy}"
 			;;
 		ia64-pc-linux-gnu)
-			profile="prefix/linux/ia64"
+			profile="prefix/${linux}/ia64${legacy}"
 			;;
 		powerpc-unknown-linux-gnu)
-			profile="prefix/linux/ppc"
+			profile="prefix/${linux}/ppc${legacy}"
 			;;
 		powerpc64-unknown-linux-gnu)
-			profile="prefix/linux/ppc64"
+			profile="prefix/${linux}/ppc64${legacy}"
 			;;
 		armv7l-pc-linux-gnu)
-			profile="prefix/linux/arm"
+			profile="prefix/${linux}/arm${legacy}"
 			;;
 		sparc-sun-solaris2.9)
 			profile="prefix/sunos/solaris/5.9/sparc"
@@ -300,10 +364,10 @@ bootstrap_setup() {
 			profile="prefix/windows/winnt/${CHOST#i586-pc-winnt}/x86"
 			;;
 		i686-pc-cygwin*)
-			profile="prefix/windows/cygwin/${CHOST#i686-pc-cygwin}/x86"
+			profile="prefix/windows/cygwin/x86"
 			;;
 		x86_64-pc-cygwin*)
-			profile="prefix/windows/cygwin/${CHOST#x86_64-pc-cygwin}/x64"
+			profile="prefix/windows/cygwin/x64"
 			;;
 		hppa64*-hp-hpux11*)
 			profile="prefix/hpux/B.11${CHOST#hppa*-hpux11}/hppa64"
@@ -356,20 +420,23 @@ bootstrap_setup() {
 
 do_tree() {
 	local x
-	for x in etc{,/portage} usr/{{,s}bin,lib} var/tmp var/lib/portage var/log/portage var/db;
+	for x in etc{,/portage} usr/{{,s}bin,$(rapx "" lib)} var/tmp var/lib/portage var/log/portage var/db;
 	do
 		[[ -d ${ROOT}/${x} ]] || mkdir -p "${ROOT}/${x}"
 	done
 	if [[ ${PREFIX_DISABLE_USR_SPLIT} == "yes" ]] ; then
-		# note to self: don't make bin a symlink to usr/bin for
-		# coreutils installs symlinks to from usr/bin to bin, which in
-		# case they are the same boils down to a pointless indirection
-		# to self
-		for x in lib sbin ; do
+		# note to self: since coreutils now listens to
+		# PREFIX_DISABLE_GEN_USR_LDSCRIPT to avoid symlinks
+		# from usr/bin to bin, we can make bin a symlink as well
+		# This is necessary for Cygwin, as there is no such thing
+		# like an embedded runpath. Instead we put all the dlls
+		# next to the exes, to get them working even without the
+		# PATH environment variable being set up.
+		for x in lib sbin bin; do
 			[[ -e ${ROOT}/${x} ]] || ( cd "${ROOT}" && ln -s usr/${x} )
 		done
 	else
-		for x in lib sbin ; do
+		for x in $(rapx "" lib) sbin ; do
 			[[ -d ${ROOT}/${x} ]] || mkdir -p "${ROOT}/${x}"
 		done
 	fi
@@ -384,11 +451,17 @@ do_tree() {
 }
 
 bootstrap_tree() {
-	local PV="20160204"
+	# RAP uses the latest gentoo main repo snapshot to bootstrap.
+	is-rap && LATEST_TREE_YES=1
+	local PV="20160614"
 	if [[ -n ${LATEST_TREE_YES} ]]; then
 		do_tree "${SNAPSHOT_URL}" portage-latest.tar.bz2
 	else
 		do_tree http://dev.gentoo.org/~grobian/distfiles prefix-overlay-${PV}.tar.bz2
+	fi
+	if is-rap; then
+		PORTDIR="${ROOT}/usr/portage-stage" \
+		       do_tree http://dev.gentoo.org/~heroxbd android-master.tar.bz2
 	fi
 }
 
@@ -413,6 +486,13 @@ bootstrap_startscript() {
 	# currently I think right into the prefix is the best location, as
 	# putting it in /bin or /usr/bin just hides it some more for the
 	# user
+	if is-rap ; then
+		mkdir -p "${ROOT}"/usr/portage/scripts
+		wget --no-check-certificate \
+		     https://gitweb.gentoo.org/repo/proj/prefix.git/plain/scripts/startprefix.in \
+		     -O "${ROOT}"/usr/portage/scripts/startprefix.in
+	fi
+
 	sed \
 		-e "s|@GENTOO_PORTAGE_EPREFIX@|${ROOT}|g" \
 		"${ROOT}"/usr/portage/scripts/startprefix.in \
@@ -442,8 +522,8 @@ bootstrap_portage() {
 	# STABLE_PV that is known to work. Intended for power users only.
 	## It is critical that STABLE_PV is the lastest (non-masked) version that is
 	## included in the snapshot for bootstrap_tree.
-	STABLE_PV="2.2.20"
-	[[ ${TESTING_PV} == latest ]] && TESTING_PV="2.2.20"
+	STABLE_PV="2.2.28"
+	[[ ${TESTING_PV} == latest ]] && TESTING_PV="2.2.28"
 	PV="${TESTING_PV:-${STABLE_PV}}"
 	A=prefix-portage-${PV}.tar.bz2
 	einfo "Bootstrapping ${A%-*}"
@@ -460,8 +540,6 @@ bootstrap_portage() {
 	S="${S}/prefix-portage-${PV}"
 	cd "${S}"
 
-	patch -p1 < "${ROOT}"/usr/portage/sys-apps/portage/files/portage-2.2.10.1-brokentty-more-platforms.patch # now upstream
-
 	# disable ipc
 	sed -e "s:_enable_ipc_daemon = True:_enable_ipc_daemon = False:" \
 		-i pym/_emerge/AbstractEbuildProcess.py || \
@@ -474,7 +552,8 @@ bootstrap_portage() {
 	[[ -x ${ROOT}/tmp/bin/bash ]] || [[ ! -x ${ROOT}/tmp/usr/bin/bash ]] || ln -s ../usr/bin/bash "${ROOT}"/tmp/bin/bash || return 1
 	[[ -x ${ROOT}/tmp/bin/bash ]] || ln -s "${BASH}" "${ROOT}"/tmp/bin/bash || return 1
 	[[ -x ${ROOT}/tmp/bin/sh ]] || ln -s bash "${ROOT}"/tmp/bin/sh || return 1
-	[[ -x ${ROOT}/bin/sh ]] || ln -s ../tmp/bin/sh "${ROOT}"/bin/sh || return 1
+	[[ -x ${ROOT}/bin/bash ]] || ln -s ../tmp/bin/bash "${ROOT}"/bin/bash || return 1
+	[[ -x ${ROOT}/bin/sh ]] || ln -s bash "${ROOT}"/bin/sh || return 1
 	export PORTAGE_BASH="${ROOT}"/tmp/bin/bash
 
 	einfo "Compiling ${A%-*}"
@@ -501,7 +580,9 @@ bootstrap_portage() {
 
 	[[ -e "${ROOT}"/tmp/usr/portage ]] || ln -s "${PORTDIR}" "${ROOT}"/tmp/usr/portage
 
-	if [[ -s ${PORTDIR}/profiles/repo_name ]]; then
+	if is-rap; then
+		cp -f "${ROOT}"/etc/portage/repos.conf "${ROOT}"/tmp/usr/share/portage/config/repos.conf
+	elif [[ -s ${PORTDIR}/profiles/repo_name ]]; then
 		# sync portage's repos.conf with the tree being used
 		sed -i -e "s,gentoo_prefix,$(<"${PORTDIR}"/profiles/repo_name)," "${ROOT}"/tmp/usr/share/portage/config/repos.conf || return 1
 	fi
@@ -673,6 +754,48 @@ bootstrap_python() {
 		patch -p0 < "${DISTDIR}"/02_all_disable_modules_and_ssl.patch
 	fi
 
+	# --disable-shared causes modules to probably link against the
+	# executable name, which must be the real executable at runtime
+	# as well rather than some symlink (for Cygwin at least).
+	# And with dlltool, find_library("c") can return "cygwin1.dll".
+	patch -p0 <<'EOP'
+--- Makefile.pre.in
++++ Makefile.pre.in
+@@ -185,1 +185,1 @@
+-BUILDPYTHON=	python$(BUILDEXE)
++BUILDPYTHON=	python$(VERSION)$(BUILDEXE)
+@@ -984,1 +984,1 @@
+-	export EXE; EXE="$(BUILDEXE)"; \
++	export HOSTPYTHON; HOSTPYTHON="$(HOSTPYTHON)"; \
+--- Lib/plat-generic/regen
++++ Lib/plat-generic/regen
+@@ -3,1 +3,1 @@
+-python$EXE ../../Tools/scripts/h2py.py -i '(u_long)' /usr/include/netinet/in.h
++$HOSTPYTHON ../../Tools/scripts/h2py.py -i '(u_long)' /usr/include/netinet/in.h
+--- Lib/ctypes/util.py
++++ Lib/ctypes/util.py
+@@ -41,6 +41,20 @@
+                 continue
+         return None
+ 
++elif sys.platform == "cygwin":
++    def find_library(name):
++        for libdir in ['/usr/lib', '/usr/local/lib']:
++            for libext in ['lib%s.dll.a' % name, 'lib%s.a' % name]:
++                implib = os.path.join(libdir, libext)
++                if not os.path.exists(implib):
++                    continue
++                cmd = "dlltool -I " + implib + " 2>/dev/null"
++                res = os.popen(cmd).read().replace("\n","")
++                if not res:
++                    continue
++                return res
++        return None
++
+ elif os.name == "posix":
+     # Andreas Degert's find functions, using gcc, /sbin/ldconfig, objdump
+     import re, tempfile, errno
+EOP
 	local myconf=""
 
 	case $CHOST in
@@ -837,7 +960,7 @@ bootstrap_findutils() {
 }
 
 bootstrap_wget() {
-	bootstrap_gnu wget 1.13.4
+	bootstrap_gnu wget 1.17.1 || bootstrap_gnu wget 1.13.4
 }
 
 bootstrap_grep() {
@@ -956,7 +1079,7 @@ bootstrap_stage1() { (
 	[[ ${OFFLINE_MODE} ]] || type -P wget > /dev/null || (bootstrap_wget) || return 1
 	[[ $(sed --version 2>&1) == *GNU* ]] || (bootstrap_sed) || return 1
 	[[ $(m4 --version 2>&1) == *GNU*1.4.1?* ]] || (bootstrap_m4) || return 1
-	[[ $(bison --version 2>&1) == *"(GNU Bison) 2."[345678]* ]] \
+	[[ $(bison --version 2>&1) =~ GNU" "Bison") "(2.[3-7]|[3-9]) ]] \
 		|| [[ -x ${ROOT}/tmp/usr/bin/bison ]] \
 		|| (bootstrap_bison) || return 1
 	[[ $(uniq --version 2>&1) == *"(GNU coreutils) "[6789]* ]] \
@@ -981,7 +1104,37 @@ bootstrap_stage1() { (
 			} > "${ROOT}"/tmp/usr/bin/nm
 			chmod 755 "${ROOT}"/tmp/usr/bin/nm
 			;;
+		*-darwin*)
+			# Recent Mac OS X have a nice popup to install java when
+			# it's called without being installed, this doesn't stop the
+			# process from going, but keeps popping up a dialog during
+			# the bootstrap process, which is slightly anoying.
+			# Nevertheless, we don't want Java when it's installed to be
+			# detected, so hide during the stage builds
+			{
+				echo "#!$(type -P false)"
+			} > "${ROOT}"/tmp/usr/bin/java
+			cp "${ROOT}"/tmp/usr/bin/java{,c}
+			chmod 755 "${ROOT}"/tmp/usr/bin/java{,c}
+			;;
 	esac
+	# Host compiler can output a variety of libdirs.  At stage1,
+	# they should be the same as lib.  Otherwise libffi may not be
+	# found by python.
+	if is-rap ; then
+		[[ -d ${ROOT}/tmp/usr/lib ]] || mkdir -p "${ROOT}"/tmp/usr/lib
+		local libdir
+		for libdir in lib64 lib32 libx32; do
+			if [[ ! -L ${ROOT}/tmp/usr/${libdir} ]] ; then
+				if [[ -e "${ROOT}"/tmp/usr/${libdir} ]] ; then
+					echo "${ROOT}"/tmp/usr/${libdir} should be a symlink to lib
+					return 1
+				fi
+				ln -s lib "${ROOT}"/tmp/usr/${libdir}
+			fi
+		done
+	fi
+
 	# important to have our own (non-flawed one) since Python (from
 	# Portage) and binutils use it
 	for zlib in ${ROOT}/tmp/usr/lib/libz.* ; do
@@ -1050,18 +1203,48 @@ do_emerge_pkgs() {
 		done
 		[[ -n ${pvdb} ]] && continue
 
+		local myuse=(
+			-acl
+			-berkdb
+			-fortran
+			-gdbm
+			-git
+			-libcxx
+			-nls
+			-pcre
+			-ssl
+			-python
+			bootstrap
+			clang
+			internal-glib
+		)
+		myuse=" ${myuse[*]} "
+		local use
+		for use in ${USE} ; do
+			myuse=" ${myuse/ ${use} /} "
+			myuse=" ${myuse/ -${use} /} "
+			myuse=" ${myuse/ ${use#-} /} "
+			myuse+=" ${use} "
+		done
+		myuse=( ${myuse} )
+
 		# Disable the STALE warning because the snapshot frequently gets stale.
 		#
 		# Need need to spam the user about news until the emerge -e system
 		# because the tools aren't available to read the news item yet anyway.
 		#
 		# Avoid circular deps caused by the default profiles (and IUSE defaults).
-		PORTAGE_CONFIGROOT="${EPREFIX}" \
-		PORTAGE_SYNC_STALE=0 \
-		FEATURES="-news ${FEATURES}" \
-		PYTHONPATH="${ROOT}"/tmp/usr/lib/portage/pym \
-		USE="-berkdb -fortran -gdbm -git -libcxx -nls -pcre -ssl -python bootstrap clang internal-glib ${USE}" \
-		emerge -v --oneshot --root-deps ${opts} "${pkg}" || return 1
+		echo "USE=${myuse[*]} PKG=${pkg}"
+		(
+			unset CFLAGS CXXFLAGS
+			PORTAGE_CONFIGROOT="${EPREFIX}" \
+			PORTAGE_SYNC_STALE=0 \
+			FEATURES="-news ${FEATURES}" \
+			PYTHONPATH="${ROOT}"/tmp/usr/lib/portage/pym \
+			USE="${myuse[*]}" \
+			emerge -v --oneshot --root-deps ${opts} "${pkg}" 
+		)
+		[[ $? -eq 0 ]] || return 1
 	done
 }
 
@@ -1103,22 +1286,26 @@ bootstrap_stage2() {
 		app-arch/xz-utils
 		sys-apps/gentoo-functions
 		sys-apps/baselayout-prefix
+		dev-libs/libffi
 		sys-devel/m4
 		sys-devel/flex
+		sys-apps/diffutils # needed by bison-3 build system
 		sys-devel/bison
 		sys-devel/patch
 		sys-devel/binutils-config
-		$([[ ${CHOST} == *-aix* ]] && echo sys-apps/diffutils ) # gcc can't deal with aix diffutils, gcc PR14251
 	)
+
 	# Most binary Linux distributions seem to fancy toolchains that
 	# do not do c++ support (need to install a separate package).
 	USE="${USE} -cxx" \
 	emerge_pkgs --nodeps "${pkgs[@]}" || return 1
 	
 	# Build a linker and compiler that live in ${ROOT}/tmp, but
-	# produce binaries in ${ROOT}.
+	# produce binaries in ${ROOT}. Debian multiarch supported by RAP
+	# needs ld to support sysroot.
 	USE="${USE} -cxx" \
 	TPREFIX="${ROOT}" \
+	EXTRA_ECONF=$(rapx --with-sysroot=/) \
 	emerge_pkgs --nodeps ${linker} || return 1
 
 	# gmp has cxx flag enabled by default. When dealing with a host
@@ -1126,6 +1313,7 @@ bootstrap_stage2() {
 	# package.use to disable in the temporary prefix.  
 	echo "dev-libs/gmp -cxx" >> "${ROOT}"/tmp/etc/portage/package.use
 
+	BOOTSTRAP_RAP_STAGE2=yes \
 	EXTRA_ECONF="--disable-bootstrap" \
 	GCC_MAKE_TARGET=all \
 	TPREFIX="${ROOT}" \
@@ -1142,17 +1330,20 @@ bootstrap_stage2() {
 			echo "# System compiler on Darwin Prefix is Clang, do not remove this"
 			echo "CC=${CHOST}-clang"
 			echo "CXX=${CHOST}-clang++"
+			echo "OBJC=${CHOST}-clang"
+			echo "OBJCXX=${CHOST}-clang++"
 			echo "BUILD_CC=${CHOST}-clang"
 			echo "BUILD_CXX=${CHOST}-clang++"
 		} >> "${ROOT}"/etc/portage/make.conf
-		# llvm-3.4 isn't setup to provide the CHOST symlinks, so we'll
+		# llvm won't setup symlinks to CHOST-clang here because
+		# we're in a cross-ish situation (at least according to
+		# multilib.eclass -- can't blame it at this point really)
 		# do it ourselves here to make the bootstrap continue
 		( cd "${ROOT}"/tmp/usr/bin && ln -s clang ${CHOST}-clang && ln -s clang++ ${CHOST}-clang++ )
-	else
+	elif ! is-rap ; then
 		# make sure the EPREFIX gcc shared libraries are there
 		mkdir -p "${ROOT}"/usr/${CHOST}/lib/gcc
 		cp "${ROOT}"/tmp/usr/${CHOST}/lib/gcc/* "${ROOT}"/usr/${CHOST}/lib/gcc
-
 	fi
 
 	einfo "stage2 successfully finished"
@@ -1181,13 +1372,17 @@ bootstrap_stage3() {
 		fi
 	fi
 
+	get_libdir() { portageq envvar LIBDIR_$(portageq envvar ABI) || echo lib; }
+
 	configure_toolchain || return 1
 	export CONFIG_SHELL="${ROOT}"/tmp/bin/bash
 	export CPPFLAGS="-I${ROOT}/usr/include"
-	export LDFLAGS="-I${ROOT}/usr/lib"
+	export LDFLAGS="-L${ROOT}/usr/$(get_libdir)"
 	unset CC CXX
 
 	emerge_pkgs() {
+		# stage3 tools should be used first.
+		DEFAULT_PATH="${ROOT}"$(echo /{,tmp/}{,usr/}{s,}bin | sed "s, ,:${ROOT},g") \
 		EPREFIX="${ROOT}" \
 		do_emerge_pkgs "$@"
 	}
@@ -1195,25 +1390,70 @@ bootstrap_stage3() {
 	# GCC sometimes decides that it needs to run makeinfo to update some
 	# info pages from .texi files.  Obviously we don't care at this
 	# stage and rather have it continue instead of abort the build
-	export MAKEINFO="echo makeinfo GNU texinfo 4.13"
-	
-	# Build a native compiler.
-	pkgs=(
-		$([[ ${CHOST} == *-aix* ]] && echo dev-libs/libiconv ) # bash dependency
-		sys-libs/ncurses
-		sys-libs/readline
-		app-shells/bash
-		sys-apps/sed
-		app-arch/xz-utils
-		sys-apps/gentoo-functions
-		sys-apps/baselayout-prefix
-		sys-devel/m4
-		sys-devel/flex
-		sys-devel/binutils-config
-		sys-libs/zlib
-		${linker}
-	)
-	emerge_pkgs --nodeps "${pkgs[@]}" || return 1
+	[[ -x "${ROOT}"/usr/bin/makeinfo ]] || cat > "${ROOT}"/usr/bin/makeinfo <<-EOF
+		#!${ROOT}/bin/bash
+		echo "makeinfo GNU texinfo 4.13"
+		for a in \$@; do
+		case \$a in
+		--*) f=\$(echo "\$a" | sed -r 's,--.*=(.*),\1,') ;;
+		-*) ;;
+		*) f=\$a ;;
+		esac
+		[[ -e \$f ]] || touch \$f
+		done
+		EOF
+	chmod +x "${ROOT}"/usr/bin/makeinfo
+	export INSTALL_INFO="${ROOT}"/usr/bin/makeinfo
+
+	if is-rap ; then
+		# We need ${ROOT}/usr/bin/perl to merge glibc.
+		if [[ ! -x "${ROOT}"/usr/bin/perl ]]; then
+			# trick "perl -V:apiversion" check of glibc-2.19.
+			echo -e "#!${ROOT}/bin/sh\necho 'apiversion=9999'" > "${ROOT}"/usr/bin/perl
+			chmod +x "${ROOT}"/usr/bin/perl
+		fi
+		# Tell dynamic loader the path of libgcc_s.so of stage2
+		if [[ ! -f "${ROOT}"/etc/ld.so.conf.d/stage2.conf ]]; then
+			mkdir -p "${ROOT}"/etc/ld.so.conf.d
+			dirname $(gcc -print-libgcc-file-name) > "${ROOT}"/etc/ld.so.conf.d/stage2.conf
+		fi
+
+		pkgs=(
+			sys-apps/baselayout
+			sys-apps/gentoo-functions
+			sys-kernel/linux-headers
+			sys-libs/glibc
+			sys-libs/zlib
+		)
+
+		BOOTSTRAP_RAP=yes \
+		emerge_pkgs --nodeps "${pkgs[@]}" || return 1
+	else
+		pkgs=(
+			$([[ ${CHOST} == *-aix* ]] && echo dev-libs/libiconv ) # bash dependency
+			sys-libs/ncurses
+			sys-libs/readline
+			app-shells/bash
+			sys-apps/sed
+			app-arch/xz-utils
+			sys-apps/gentoo-functions
+			sys-apps/baselayout-prefix
+			sys-devel/m4
+			sys-devel/flex
+			sys-devel/binutils-config
+			sys-libs/zlib
+			${linker}
+		)
+
+		emerge_pkgs --nodeps "${pkgs[@]}" || return 1
+	fi
+
+	# On some hosts, gcc gets confused now when it uses the new linker,
+	# see for instance bug #575480.  While we would like to hide that
+	# linker, we can't since we want the compiler to pick it up.
+	# Therefore, inject some kludgy workaround, for deps like gmp that
+	# use c++
+	[[ ${CHOST} != *-darwin* ]] && ! is-rap && export CXX="${CHOST}-g++ -lgcc_s"
 
 	# Clang unconditionally requires python, the eclasses are really not
 	# setup for a scenario where python doesn't live in the target
@@ -1221,30 +1461,42 @@ bootstrap_stage3() {
 	( cd "${ROOT}"/usr/bin && test ! -e python && ln -s "${ROOT}"/tmp/usr/bin/python2.7 )
 	# in addition, avoid collisions
 	rm -Rf "${ROOT}"/tmp/usr/lib/python2.7/site-packages/clang
-	emerge_pkgs --nodeps ${compiler} || return 1
-	( cd "${ROOT}"/usr/bin && test ! -e python && rm -f python2.7 )
 
+	RAP_DLINKER=$(echo "${ROOT}"/$(get_libdir)/ld*.so.[0-9])
+	# try to get ourself out of the mudd, bug #575324
+	EXTRA_ECONF="--disable-compiler-version-checks $(rapx --disable-lto)" \
+	LDFLAGS="${LDFLAGS} $(rapx -Wl,--dynamic-linker=${RAP_DLINKER})" \
+	emerge_pkgs --nodeps ${compiler} || return 1
+	# undo libgcc_s.so path of stage2
+
+	rm -f "${ROOT}"/etc/ld.so.conf.d/stage2.conf
+	if is-rap ; then
+		"${ROOT}"/usr/sbin/ldconfig
+		# should be linked against stage3 zlib, and can only
+		# be compiled after gcc has the headers of Prefix glibc.
+		emerge_pkgs --nodeps sys-devel/binutils-config ${linker} || return 1
+	fi
+
+	( cd "${ROOT}"/usr/bin && test ! -e python && rm -f python2.7 )
 	# Use $ROOT tools where possible from now on.
 	rm -f "${ROOT}"/bin/sh
 	ln -s bash "${ROOT}"/bin/sh
-	export CONFIG_SHELL="${ROOT}/bin/bash"
-	export PREROOTPATH="${ROOT}/usr/bin:${ROOT}/bin"
+	unset CONFIG_SHELL
 	unset MAKEINFO
+	unset CXX
+	export PREROOTPATH="${ROOT}/usr/bin:${ROOT}/bin"
 
 	# Build portage and dependencies.
 	pkgs=(
 		sys-apps/coreutils
 		sys-apps/findutils
+		app-arch/gzip
 		app-arch/tar
 		sys-apps/grep
 		sys-apps/gawk
 		sys-devel/make
 		sys-apps/file
 		app-admin/eselect
-		$( [[ ${OFFLINE_MODE} ]] || echo sys-devel/gettext )
-		$( [[ ${OFFLINE_MODE} ]] || echo net-misc/wget )
-		virtual/os-headers
-		sys-apps/portage
 	)
 	# for grep we need to do a little workaround as we use llvm-3.4
 	# here, which doesn't necessarily grok the system headers on newer
@@ -1252,14 +1504,23 @@ bootstrap_stage3() {
 	ac_cv_c_decl_report=warning \
 	emerge_pkgs "" "${pkgs[@]}" || return 1
 
+	# gettext pulls in portage, which since 2.2.28 needs ssl enabled, so
+	# we need to lift our mask for that.
+	pkgs=(
+		$( [[ ${OFFLINE_MODE} ]] || echo sys-devel/gettext )
+		$( [[ ${OFFLINE_MODE} ]] || echo net-misc/wget )
+		virtual/os-headers
+		sys-apps/portage
+	)
+	if [[ ! -x "${ROOT}"/sbin/openrc-run ]]; then
+		echo "We need openrc-run at ${ROOT}/sbin to merge rsync." > "${ROOT}"/sbin/openrc-run
+		chmod +x "${ROOT}"/sbin/openrc-run
+	fi
+	USE="ssl" \
+	emerge_pkgs "" "${pkgs[@]}" || return 1
+
 	# Switch to the proper portage.
 	hash -r
-
-	# Get rid of the temporary tools.
-	if [[ -d ${ROOT}/tmp/var/tmp ]] ; then
-		rm -rf "${ROOT}"/tmp
-		mkdir "${ROOT}"/tmp
-	fi
 
 	# Update the portage tree.
 	treedate=$(date -f "${ROOT}"/usr/portage/metadata/timestamp +%s)
@@ -1273,10 +1534,17 @@ bootstrap_stage3() {
 	fi
 
 	# temporarily work around c_rehash missing openssl dependency, bug #572790
-	emerge -1 openssl || return 1
+	CFLAGS= CXXFLAGS= emerge -1 openssl || return 1
 
-	# Portage should figure out itself what it needs to do, if anything
-	USE="-git" emerge -u system || return 1
+	# Portage should figure out itself what it needs to do, if anything.
+	# Avoid glib compiling for Cocoa libs if it finds them, since we're
+	# still with an old llvm that may not understand the system headers
+	# very well on Darwin (-DGNUSTEP_BASE_VERSION hack)
+	CPPFLAGS="-DGNUSTEP_BASE_VERSION" \
+	CFLAGS= CXXFLAGS= USE="-git" emerge -u system || return 1
+
+	# TODO, glibc should depend on texinfo
+	is-rap && { emerge sys-apps/texinfo || return 1; }
 
 	# remove anything that we don't need (compilers most likely)
 	emerge --depclean
@@ -1295,83 +1563,11 @@ bootstrap_interactive() {
 	# eventually ends up in make.conf, see the end of stage3.  We don't
 	# do this in bootstrap_setup() because in that case we'd also have
 	# to cater for getting this right with manual bootstraps.
-	export PREFIX_DISABLE_USR_SPLIT=yes 
+	is-rap || export PREFIX_DISABLE_USR_SPLIT=yes
 
-	# immediately die on platforms that we know are impossible due to
-	# brain-deadness (Debian/Ubuntu) or extremely hard dependency chains
-	# (TODO NetBSD/OpenBSD)
-	case ${CHOST} in
-		*-linux-gnu)
-			local toolchain_impossible=
-			# Figure out if this is Ubuntu...
-			if [[ $(lsb_release -is 2>/dev/null) == "Ubuntu" ]] ; then
-				case "$(lsb_release -sr)" in
-					[456789].*|10.*)
-						: # good versions
-						;;
-					*)
-						# Debian/Ubuntu have seriously fscked up their
-						# toolchain to support their multi-arch crap
-						# since Natty (11.04) that noone really wants,
-						# and certainly not upstream.  Some details:
-						# https://bugs.launchpad.net/ubuntu/+source/binutils/+bug/738098
-						toolchain_impossible="Ubuntu >= 11.04 (Natty)"
-						;;
-				esac
-			fi
-			# Figure out if this is Debian
-			if [[ -e /etc/debian_release ]] ; then
-				case "$(< /etc/debian_release)" in
-					hamm/*|slink/*|potato/*|woody/*|sarge/*|etch/*|lenny/*|squeeze/*)
-						: # good versions
-						;;
-					*)
-						# Debian introduced their big crap since Wheezy
-						# (7.0), like for Ubuntu, see above
-						toolchain_impossible="Debian >= 7.0 (Wheezy)"
-						;;
-				esac
-			fi
-			if [[ -n ${toolchain_impossible} ]] ; then
-				# In short, it's impossible for us to compile a
-				# compiler, since 1) gcc picks up our ld, which doesn't
-				# support sysroot (can work around with a wrapper
-				# script), 2) headers and libs aren't found (symlink
-				# them to Prefix), 3) stuff like crtX.i isn't found
-				# during bootstrap, since the bootstrap compiler doesn't
-				# get any of our flags and doesn't know where to find
-				# them (even if we copied them).  So we cannot do this,
-				# unless we use the Ubuntu patches in our ebuilds, which
-				# is a NO-GO area.
-				cat << EOF
-Oh My!  ${toolchain_impossible}!  AAAAAAAAAAAAAAAAAAAAARGH!  HELL comes over me!
-
-EOF
-				echo -n "..."
-				sleep 1
-				echo -n "."
-				sleep 1
-				echo -n "."
-				sleep 1
-				echo -n "."
-				sleep 1
-				echo
-				echo
-				cat << EOF
-and over you.  You're on the worst Linux distribution from a developer's
-(and so Gentoo Prefix) perspective since http://wiki.debian.org/Multiarch/.
-Due to this multi-arch idea, it is IMPOSSIBLE for Gentoo Prefix to
-bootstrap a compiler without using Debuntu patches, which is an absolute
-NO-GO area!  GCC and binutils upstreams didn't just reject those patches
-for fun.
-
-I really can't help you, and won't waste any of your time either.  The
-story simply ends here.  Sorry.
-EOF
-				exit 1
-			fi
-			;;
-	esac
+	# TODO should immediately die on platforms that we know are
+	# impossible due extremely hard dependency chains
+	# (NetBSD/OpenBSD)
 
 	cat <<"EOF"
 
@@ -1439,6 +1635,7 @@ EOF
 		PERL_MM_OPT \
 		PKG_CONFIG_PATH \
 		PYTHONPATH \
+		ROOT \
 	; do
 		# starting on purpose a shell here iso ${!flag} because I want
 		# to know if the shell initialisation files trigger this
@@ -1579,7 +1776,7 @@ from here, eh?  I just think you didn't install one.  I know it can be
 tricky on OpenIndiana, for instance, so won't blame you.  In case you're
 on OpenIndiana, I'll help you a bit.  Perform the following as
 super-user:
-  pkg install developer/gnu system/library/math/header-math
+  pkg install developer/gnu system/header
 In the meanwhile, I'll wait here until you run me again, with a compiler.
 EOF
 				fi
@@ -1624,22 +1821,36 @@ EOF
 		echo "Great!  You appear to have a compiler in your PATH"
 	fi
 
-	if type -P xcode-select > /dev/null && [[ ! -d /usr/include ]] ; then
-		# bug #512032
-		cat << EOF
+	if type -P xcode-select > /dev/null ; then
+		if [[ ! -d /usr/include ]] ; then
+			# bug #512032
+			cat << EOF
 
 You don't have /usr/include, this thwarts me to build stuff.
 Please execute:
   xcode-select --install
 or install /usr/include in another way and try running me again.
 EOF
-		exit 1
-	fi
+			exit 1
+		fi
+		if [[ $(xcode-select -p) != */CommandLineTools ]] ; then
+			# to an extent, bug #564814 and bug #562800
+			cat << EOF
 
+Your xcode-select is not set to CommandLineTools.  This prevents builds
+from succeeding.  Switch to command line tools for the bootstrap to
+continue.  Please execute:
+  xcode-select -s /Library/Developer/CommandLineTools
+and try running me again.
+EOF
+			exit 1
+		fi
+	fi
+	
 	echo
 	local ncpu=
     case "${CHOST}" in
-		*-cygwin*)     ncpu=${NUMBER_OF_PROCESSORS}                        ;;
+		*-cygwin*)     ncpu=$(cmd /D /Q /C 'echo %NUMBER_OF_PROCESSORS%')  ;;
 		*-darwin*)     ncpu=$(/usr/sbin/sysctl -n hw.ncpu)                 ;;
 		*-freebsd*)    ncpu=$(/sbin/sysctl -n hw.ncpu)                     ;;
 		*-solaris*)    ncpu=$(/usr/sbin/psrinfo | wc -l)                   ;;
@@ -1957,9 +2168,15 @@ EOF
 		exit 1
 	fi
 
-	hash -r  # tmp/* stuff is removed in stage3
+	if emerge -e system ; then
+		# Now, after 'emerge -e system', we can get rid of the temporary tools.
+		if [[ -d ${EPREFIX}/tmp/var/tmp ]] ; then
+			rm -Rf "${EPREFIX}"/tmp || return 1
+			mkdir -p "${EPREFIX}"/tmp || return 1
+		fi
 
-	if ! emerge -e system ; then
+		hash -r  # tmp/* stuff is removed in stage3
+	else
 		# emerge -e system fail
 		cat << EOF
 
@@ -2071,12 +2288,9 @@ if [[ -z ${CHOST} ]]; then
 				;;
 			CYGWIN*)
 				case `uname -r` in
-					1.7*) # http://www.cygwin.com/ml/cygwin/2009-02/msg00669.html
-						CHOST="`uname -m`-pc-cygwin1.7"
-					;;
-					2.[0-9]*) # https://sourceware.org/ml/cygwin/2015-04/msg00595.html
-						# probably split on important features
-						CHOST="`uname -m`-pc-cygwin2.0"
+					[0-1].*|2.[0-4].*|2.5.[0-1]|2.5.[0-1]'('*)
+						eerror "Can't deal with Cygwin before 2.5.2 or so, sorry!"
+						exit 1
 					;;
 					*)
 						CHOST="`uname -m`-pc-cygwin"
@@ -2257,9 +2471,10 @@ export PORTDIR=${PORTDIR:-"${ROOT}/usr/portage"}
 export DISTDIR=${DISTDIR:-"${PORTDIR}/distfiles"}
 PORTAGE_TMPDIR=${PORTAGE_TMPDIR:-${ROOT}/tmp/var/tmp}
 DISTFILES_URL=${DISTFILES_URL:-"http://dev.gentoo.org/~grobian/distfiles"}
-SNAPSHOT_URL=${SNAPSHOT_URL:-"http://rsync.prefix.bitzolder.nl/snapshots"}
 GNU_URL=${GNU_URL:="http://ftp.gnu.org/gnu"}
 GENTOO_MIRRORS=${GENTOO_MIRRORS:="http://distfiles.gentoo.org"}
+SNAPSHOT_HOST=$(rapx ${GENTOO_MIRRORS} http://rsync.prefix.bitzolder.nl)
+SNAPSHOT_URL=${SNAPSHOT_URL:-"${SNAPSHOT_HOST}/snapshots"}
 GCC_APPLE_URL="http://www.opensource.apple.com/darwinsource/tarballs/other"
 
 export MAKE CONFIG_SHELL
@@ -2293,3 +2508,8 @@ fi
 einfo "ready to bootstrap ${TODO}"
 # bootstrap_interactive proceeds with guessed defaults when TODO=noninteractive
 bootstrap_${TODO#non} || exit 1
+
+# Local Variables:
+# sh-indentation: 8
+# sh-basic-offset: 8
+# End:
